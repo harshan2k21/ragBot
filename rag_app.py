@@ -1,140 +1,27 @@
 import os
 import requests
 from bs4 import BeautifulSoup
-from sentence_transformers import SentenceTransformer
-import faiss
 import numpy as np
-from transformers import pipeline, AutoTokenizer, AutoModelForQuestionAnswering
+import faiss
+from transformers import AutoTokenizer, AutoModel, AutoModelForQuestionAnswering, pipeline
+import torch
 from flask import Flask, request, jsonify, render_template_string
 
-# --- 1. Configuration ---
-# You can change this URL to any documentation site you want to scrape.
-# Let's use the documentation for `requests`, a popular Python library.
+# --- Configuration ---
+# Use an environment variable for the app's root directory, fallback for local dev
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 DOCS_URL = "https://requests.readthedocs.io/en/latest/"
-INDEX_FILE = "docs.index"
-DOC_CONTENT_FILE = "docs_content.txt"
+INDEX_FILE = os.path.join(APP_ROOT, "docs.index")
+DOC_CONTENT_FILE = os.path.join(APP_ROOT, "docs_content.txt")
 
-# --- 2. Flask App Initialization ---
-app = Flask(__name__)
-
-# --- 3. Global Variables for AI Models and Data ---
-# We load these globally to avoid reloading them on every request, which would be very slow.
-vectorizer = None
+# --- Global Variables ---
+# These will be initialized by initialize_rag_pipeline()
+retriever = None
 qa_pipeline = None
-index = None
-documents = []
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- 4. Core RAG Pipeline Functions ---
-
-def scrape_documentation(url):
-    """
-    Scrapes text content from the given URL.
-    This is a simple scraper and might need to be adapted for different website structures.
-    """
-    print(f"Scraping documentation from {url}...")
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
-
-        # Find the main content area of the documentation
-        # Note: The class name 'document' is common in Sphinx-based docs like requests'.
-        content = soup.find('div', role='main') or soup.find('div', class_='document')
-        if not content:
-            # Fallback to body if specific content divs aren't found
-            content = soup.body
-
-        text = content.get_text(separator='\n', strip=True)
-        print("Scraping complete.")
-        return text
-    except requests.RequestException as e:
-        print(f"Error scraping documentation: {e}")
-        return ""
-
-def preprocess_and_chunk(text):
-    """
-    Splits the scraped text into smaller, manageable chunks (e.g., paragraphs).
-    """
-    print("Preprocessing and chunking text...")
-    # Split by double newlines (common paragraph separator) and filter out empty lines.
-    chunks = [chunk.strip() for chunk in text.split('\n\n') if chunk.strip()]
-    print(f"Created {len(chunks)} chunks.")
-    return chunks
-
-def build_and_save_vector_index(chunks, vectorizer_model):
-    """
-    Creates vector embeddings for each text chunk and builds a FAISS index for fast searching.
-    """
-    print("Creating vector embeddings for chunks...")
-    embeddings = vectorizer_model.encode(chunks, show_progress_bar=True)
-    
-    print("Building FAISS index...")
-    d = embeddings.shape[1]  # Get the dimension of the vectors
-    faiss_index = faiss.IndexFlatL2(d)
-    faiss_index.add(embeddings)
-    
-    print(f"Saving FAISS index to {INDEX_FILE}...")
-    faiss.write_index(faiss_index, INDEX_FILE)
-
-    # Also save the original text chunks for context retrieval
-    with open(DOC_CONTENT_FILE, 'w', encoding='utf-8') as f:
-        for chunk in chunks:
-            f.write(chunk + "\n---\n") # Use a separator
-    
-    print("Index and content saved.")
-    return faiss_index
-
-def retrieve_context(query, vectorizer_model, faiss_index, docs, k=5):
-    """
-    Finds the most relevant document chunks for a given query using the FAISS index.
-    """
-    print(f"Retrieving context for query: '{query}'")
-    query_vector = vectorizer_model.encode([query])
-    distances, indices = faiss_index.search(query_vector, k)
-    
-    # Retrieve the actual text chunks based on the indices
-    retrieved_docs = [docs[i] for i in indices[0]]
-    context = " ".join(retrieved_docs)
-    print("Context retrieved.")
-    return context
-
-# --- 5. Initial Setup Function ---
-def initialize_rag_pipeline():
-    """
-    This function orchestrates the entire setup process.
-    It checks if an index exists and either loads it or builds a new one.
-    """
-    global vectorizer, qa_pipeline, index, documents
-
-    print("Initializing RAG pipeline...")
-    # Load the model for creating vector embeddings.
-    # 'all-MiniLM-L6-v2' is a great balance of speed and quality.
-    vectorizer = SentenceTransformer('all-MiniLM-L6-v2')
-
-    # Load a pre-trained model for Question-Answering.
-    # 'distilbert-base-cased-distilled-squad' is a smaller, faster model.
-    model_name = "distilbert-base-cased-distilled-squad"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForQuestionAnswering.from_pretrained(model_name)
-    qa_pipeline = pipeline('question-answering', model=model, tokenizer=tokenizer)
-
-    if os.path.exists(INDEX_FILE) and os.path.exists(DOC_CONTENT_FILE):
-        print("Loading existing index and documents...")
-        index = faiss.read_index(INDEX_FILE)
-        with open(DOC_CONTENT_FILE, 'r', encoding='utf-8') as f:
-            documents = f.read().split("\n---\n")
-    else:
-        print("No index found. Building a new one...")
-        raw_text = scrape_documentation(DOCS_URL)
-        documents = preprocess_and_chunk(raw_text)
-        index = build_and_save_vector_index(documents, vectorizer)
-    
-    print("RAG Pipeline is ready!")
-
-# --- 6. Flask Web Routes ---
-
-# The HTML template is defined directly in the Python string for simplicity.
-# It uses Tailwind CSS for modern styling.
+# --- HTML & CSS Template ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -149,8 +36,8 @@ HTML_TEMPLATE = """
             border: 4px solid #f3f3f3;
             border-top: 4px solid #3498db;
             border-radius: 50%;
-            width: 30px;
-            height: 30px;
+            width: 24px;
+            height: 24px;
             animation: spin 1s linear infinite;
         }
         @keyframes spin {
@@ -159,48 +46,45 @@ HTML_TEMPLATE = """
         }
     </style>
 </head>
-<body class="bg-gray-100 text-gray-800">
-    <div class="container mx-auto p-4 md:p-8 max-w-3xl">
-        <div class="bg-white rounded-xl shadow-lg p-6 md:p-8">
-            <h1 class="text-3xl md:text-4xl font-bold text-center text-gray-900 mb-2">Documentation Q&A Bot</h1>
-            <p class="text-center text-gray-500 mb-6">Ask a question about the 'requests' Python library.</p>
-            
-            <form id="qa-form" class="flex flex-col sm:flex-row gap-3">
-                <input type="text" id="question" class="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none transition" placeholder="e.g., How do I send a POST request?">
-                <button type="submit" class="bg-blue-600 text-white font-bold py-3 px-6 rounded-lg hover:bg-blue-700 transition duration-300 flex items-center justify-center">
-                    <span id="button-text">Ask</span>
-                    <div id="loader" class="loader hidden ml-3"></div>
-                </button>
-            </form>
-
-            <div id="answer-container" class="mt-8 p-6 bg-gray-50 rounded-lg border border-gray-200 hidden">
-                <h2 class="text-xl font-semibold mb-2 text-gray-800">Answer:</h2>
-                <p id="answer" class="text-gray-700 whitespace-pre-wrap"></p>
-            </div>
+<body class="bg-gray-100 flex items-center justify-center min-h-screen">
+    <div class="bg-white p-8 rounded-lg shadow-lg w-full max-w-2xl">
+        <h1 class="text-2xl font-bold mb-4 text-center text-gray-800">RAG-Powered Q&A Bot</h1>
+        <p class="text-gray-600 mb-6 text-center">Ask a question about the Python 'requests' library.</p>
+        <div class="mb-4">
+            <input type="text" id="questionInput" class="w-full px-4 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="e.g., How to add headers to a request?">
         </div>
-        <footer class="text-center mt-6 text-sm text-gray-400">
-            <p>Powered by RAG & Flask</p>
-        </footer>
+        <div class="text-center mb-6">
+            <button id="askButton" class="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-6 rounded-md transition duration-300">Ask</button>
+        </div>
+        <div id="response" class="p-4 bg-gray-50 rounded-md border min-h-[100px]">
+             <p class="text-gray-500">Your answer will appear here...</p>
+        </div>
+        <div id="loader" class="hidden flex justify-center mt-4"><div class="loader"></div></div>
     </div>
 
     <script>
-        const form = document.getElementById('qa-form');
-        const questionInput = document.getElementById('question');
-        const answerContainer = document.getElementById('answer-container');
-        const answerEl = document.getElementById('answer');
-        const buttonText = document.getElementById('button-text');
+        const askButton = document.getElementById('askButton');
+        const questionInput = document.getElementById('questionInput');
+        const responseDiv = document.getElementById('response');
         const loader = document.getElementById('loader');
 
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const question = questionInput.value;
-            if (!question.trim()) return;
+        askButton.addEventListener('click', askQuestion);
+        questionInput.addEventListener('keyup', (event) => {
+            if (event.key === 'Enter') {
+                askQuestion();
+            }
+        });
 
-            // Show loader and disable form
-            buttonText.classList.add('hidden');
+        async function askQuestion() {
+            const question = questionInput.value;
+            if (!question) {
+                responseDiv.innerHTML = '<p class="text-red-500">Please enter a question.</p>';
+                return;
+            }
+
             loader.classList.remove('hidden');
-            form.querySelector('button').disabled = true;
-            answerContainer.classList.add('hidden');
+            responseDiv.innerHTML = '<p class="text-gray-500">Thinking...</p>';
+            askButton.disabled = true;
 
             try {
                 const response = await fetch('/ask', {
@@ -210,58 +94,132 @@ HTML_TEMPLATE = """
                 });
 
                 if (!response.ok) {
-                    throw new Error('Network response was not ok');
+                    throw new Error(`HTTP error! status: ${response.status}`);
                 }
 
                 const data = await response.json();
-                
-                answerEl.textContent = data.answer || "Sorry, I couldn't find an answer in the documentation.";
-                answerContainer.classList.remove('hidden');
+                responseDiv.innerHTML = `<p class="text-gray-800">${data.answer.replace(/\\n/g, '<br>')}</p>`;
 
             } catch (error) {
                 console.error('Error:', error);
-                answerEl.textContent = 'An error occurred while fetching the answer. Please try again.';
-                answerContainer.classList.remove('hidden');
+                responseDiv.innerHTML = '<p class="text-red-500">Sorry, something went wrong. Please check the console for details.</p>';
             } finally {
-                // Hide loader and re-enable form
-                buttonText.classList.remove('hidden');
                 loader.classList.add('hidden');
-                form.querySelector('button').disabled = false;
+                askButton.disabled = false;
             }
-        });
+        }
     </script>
 </body>
 </html>
 """
 
+# --- Core RAG Logic ---
+
+def initialize_rag_pipeline():
+    """Initializes the entire RAG pipeline."""
+    print("Initializing RAG pipeline...")
+    global qa_pipeline, retriever
+    
+    # Check if index files exist. If not, create them.
+    if not os.path.exists(INDEX_FILE) or not os.path.exists(DOC_CONTENT_FILE):
+        print(f"'{INDEX_FILE}' or '{DOC_CONTENT_FILE}' not found. Starting build process...")
+        
+        # 1. Scrape Website
+        print(f"Scraping content from {DOCS_URL}...")
+        try:
+            response = requests.get(DOCS_URL)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            text_content = soup.get_text(separator='\n', strip=True)
+            print("Scraping successful.")
+        except requests.RequestException as e:
+            print(f"Error scraping website: {e}")
+            return
+
+        # 2. Chunk Documents
+        documents = [para.strip() for para in text_content.split('\n') if len(para.strip()) > 50]
+        print(f"Created {len(documents)} document chunks.")
+
+        # 3. Create Embeddings and Index
+        print("Loading sentence transformer model for embeddings...")
+        embedding_model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2').to(device)
+        embedding_tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
+
+        print("Generating embeddings for documents... (This may take a while)")
+        embeddings = []
+        for doc in documents:
+            inputs = embedding_tokenizer(doc, return_tensors='pt', truncation=True, max_length=512).to(device)
+            with torch.no_grad():
+                output = embedding_model(**inputs)
+            embeddings.append(output.last_hidden_state.mean(dim=1).cpu().numpy())
+        
+        doc_embeddings = np.vstack(embeddings)
+        dimension = doc_embeddings.shape[1]
+        index = faiss.IndexFlatL2(dimension)
+        index.add(doc_embeddings)
+        print("FAISS index created successfully.")
+
+        # 4. Save the index and documents
+        faiss.write_index(index, INDEX_FILE)
+        with open(DOC_CONTENT_FILE, 'w', encoding='utf-8') as f:
+            for doc in documents:
+                f.write(f"{doc}\n")
+        print(f"Index saved to '{INDEX_FILE}', content saved to '{DOC_CONTENT_FILE}'.")
+
+    # 5. Load the models and the saved index/documents for the application
+    print("Loading models and pre-built index...")
+    embedding_model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2').to(device)
+    embedding_tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
+    
+    index = faiss.read_index(INDEX_FILE)
+    documents = [line.strip() for line in open(DOC_CONTENT_FILE, 'r', encoding='utf-8')]
+    
+    def retrieve_documents(query, k=5):
+        """Retrieve top-k documents from the FAISS index."""
+        inputs = embedding_tokenizer(query, return_tensors='pt').to(device)
+        with torch.no_grad():
+            output = embedding_model(**inputs)
+        query_embedding = output.last_hidden_state.mean(dim=1).cpu().numpy()
+        
+        _, indices = index.search(query_embedding, k)
+        return [documents[i] for i in indices[0]]
+
+    retriever = retrieve_documents
+    qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad", tokenizer="distilbert-base-cased-distilled-squad", device=0 if device=="cuda" else -1)
+    
+    print("RAG pipeline is ready!")
+
+
+# --- Flask Web Server ---
+app = Flask(__name__)
+
 @app.route('/')
 def home():
-    """Renders the main HTML page."""
+    """Serves the main HTML page."""
     return render_template_string(HTML_TEMPLATE)
 
 @app.route('/ask', methods=['POST'])
 def ask():
-    """
-    Handles the question from the frontend, runs the RAG pipeline, and returns the answer.
-    """
-    data = request.get_json()
-    question = data.get('question')
-
+    """Handles the question answering logic."""
+    if not retriever or not qa_pipeline:
+        return jsonify({"error": "RAG pipeline not initialized"}), 500
+        
+    data = request.json
+    question = data.get("question")
     if not question:
-        return jsonify({'error': 'Question is required'}), 400
+        return jsonify({"error": "No question provided"}), 400
 
-    # 1. Retrieve relevant context from the vector database
-    context = retrieve_context(question, vectorizer, index, documents)
+    # 1. Retrieve relevant documents
+    retrieved_docs = retriever(question)
+    context = " ".join(retrieved_docs)
 
-    # 2. Use the QA model to generate an answer based on the context
+    # 2. Use QA model to find the answer in the context
     result = qa_pipeline(question=question, context=context)
     
-    return jsonify({'answer': result['answer']})
+    return jsonify({"answer": result['answer']})
 
-
-# --- 7. Main Execution Block ---
 if __name__ == '__main__':
-    # Initialize the models and data pipeline before starting the web server
     initialize_rag_pipeline()
-    # Run the Flask app
-    app.run(debug=True)
+    # Note: Using debug=False for production-like local testing.
+    # For actual debugging, you might want to set it to True.
+    app.run(host='0.0.0.0', port=5000, debug=False)

@@ -5,7 +5,4 @@ sentence-transformers==2.2.2
 faiss-cpu==1.8.0
 transformers==4.24.0
 torch==2.2.0
-torchvision==0.17.0
-torchaudio==2.2.0
-numpy
-flask
+numpy==1.23.5

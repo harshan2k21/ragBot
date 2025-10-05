@@ -1,8 +1,8 @@
-flask
-requests
-beautifulsoup4
+flask==2.3.2
+requests==2.31.0
+beautifulsoup4==4.12.2
 sentence-transformers==2.2.2
 faiss-cpu==1.8.0
 transformers==4.24.0
 torch==2.2.0
-numpy
+numpy==1.26.4
